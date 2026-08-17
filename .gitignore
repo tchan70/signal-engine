@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 logs/
+!logs/.gitkeep
 state/
 .pytest_cache/
 *.pickle
