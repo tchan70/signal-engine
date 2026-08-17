@@ -51,214 +51,45 @@ executor:
   backend: "paper"  # paper | mcp
   mcp_url: "https://agent.robinhood.com/mcp/trading"
 
-# --- Discord Signal Sources ---
-# the signal provider — follow caller_a + caller_b + caller_c-picks
-#
-# CHANNEL LAYOUT (as of Feb 2026):
-#   caller_b:       caller_b-alerts, caller_b-breakdown
-#   DOUGH DADDY:    dd-alerts, dd-breakdown
-#   REAL DONALD PUMP: rdp-alerts, spx-qqq-spy-alerts, 0dte-advisory-breakdown, rdp-breakdown
-#   caller_a:      caller_a-challenge, caller_a-breakdown, caller_a-alerts
-#   BRENT:          brent-alerts, brent-breakdown
-#   MRS. Z:         mrsz-alerts, mrs-z-flow, mrsz-breakdown
-#   SKINEE:         skinee-alerts, skinee-breakdown
-#   DOUGH DILIGENCE: creation-breakdown, piggys-breakdown
-#   THE provider:     high-risk-lottos-alerts, caller_c-picks
-#   Seek the Heat:  ta_source-analysis, ta_source-breakroom
-#
-# We follow: caller_a (both channels), caller_b, caller_c-picks
-# + breakdowns and ta_source for conviction boosting
-discord:
-  user_token: "${DISCORD_USER_TOKEN}"
-  # Session 9: cap on attachment/embed image downloads (bytes). Oversized files
-  # are skipped instead of being base64'd into a guaranteed API rejection.
+# --- Signal Sources ---
+# The public tree ingests messages through the generic contract in
+# ingest/jsonl_source.py: any adapter that yields message dicts (content,
+# author, attached images, channel_meta) can drive the pipeline. The original
+# real-time chat/social ingestion adapters are excluded from this repository
+# (platform-ToS and third-party-content constraints — see PORTING_NOTES.md),
+# so this section documents the channel metadata the pipeline expects from an
+# adapter rather than configuring a live connection.
+ingestion:
+  # Cap on attachment image downloads (bytes). Oversized files are skipped
+  # instead of being base64'd into a guaranteed API rejection.
   image_max_bytes: 8388608  # 8 MB
-  # Session 10: reconnect backfill caps — on gateway reconnect the bot replays
-  # missed messages per channel, bounded by age and count so a long outage
-  # can't flood the pipeline with stale signals.
-  # Reconnect backfill: messages older than this are not replayed at all.
-  #
-  # Raised 120 → 720 on 2026-07-31. The bot is stopped overnight, so the
-  # morning start is a "reconnect" spanning the whole night, and at 120 the
-  # gate silently dropped everything posted in it. caller_a's "Will buy 1 SOUN"
-  # (01:09 BST) was fetched and discarded on the 05:45 start — the only trace
-  # was `1 skipped as older than 120 min`, which names no ticker.
-  #
-  # Raising it does NOT make old entries tradeable. A backfilled ENTRY older
-  # than `entry_stale_after_seconds` is routed notify-only (⏰ MISSED ENTRY
-  # (backfill)) and returns before the market-hours/queue logic is reached —
-  # so 12h buys visibility over the overnight channel, not exposure. Caller
-  # EXITS were never subject to this gate anyway: they are rescued by name
-  # (EXIT_HINT_RE) at any age, after the 2026-07-23 incident where ten dropped
-  # messages left the book out of sync.
-  #
-  # Cost is one parser call per overnight message on the morning start —
-  # cents, on a channel that posts a handful a day.
-  backfill_max_age_minutes: 720
-  backfill_limit: 50             # Max messages fetched per channel after a reconnect
-  # Session 10: gateway watchdog — prolonged silence during market hours usually
-  # means a dead connection, not a quiet channel; alert so a restart can happen.
-  watchdog_stale_minutes: 10     # Alert if the gateway is silent this long during market hours
-  # Session 10: stale-entry safety — a backfilled ENTRY has moved prices by the
-  # time it's replayed; past this age it's notify-only. Exits are never blocked.
-  entry_stale_after_seconds: 600 # Backfilled ENTRY signals older than this become notify-only (exits always process)
+  # A backfilled/replayed ENTRY older than this has already moved the market:
+  # it is routed notify-only instead of traded. Exits are never age-blocked —
+  # following a caller out is always safer than not.
+  entry_stale_after_seconds: 600
   channels:
-    # ── caller_a ─────────────────────────────────────────────
-    # $500 challenge: always has contract counts → use challenge multiplier sizing
-    - id: "${DAT_500_CHALLENGE_CHANNEL_ID}"
+    # ── Example caller channel (generates trades) ─────────────────────────
+    - id: "${CALLER_CHANNEL_ID}"
       name: "caller_a-challenge"
       priority: "high"
       type: "caller"
       caller: "caller_a"
-      management_style: "challenge"  # Tight stop, high trail activation — see management section
-      sizing_mode: "challenge"       # Direct multiplier on caller's contract count
+      management_style: "challenge"  # managed | fire_and_forget | challenge
+      sizing_mode: "challenge"       # challenge = mirror caller contract count | percentage = % of account
 
-    # Main their broker account plays: larger sizes, no contract counts → use % sizing
-    # execute_trades: false — idea-only until account grows; contracts too expensive
-    # ═══ Session 9b (2026-07-22): SINGLE-CHANNEL MODE ═══════════════════
-    # Only caller_a-challenge is live. The blocks below are intentionally
-    # commented out — breakdown/idea channels are for the operator's own reading,
-    # not bot interpretation. To re-enable a channel, uncomment its block.
-    # - id: "${DAT_ALERTS_CHANNEL_ID}"
-    # name: "caller_a-alerts"
-    # priority: "high"
-    # type: "caller"
-    # caller: "caller_a"
-    # management_style: "managed"
-    # sizing_mode: "percentage"  # Conviction-based % of account
-    # execute_trades: false      # Idea-only: notify but do not place orders
+    # ── Example breakdown/thesis channel (context only, never trades) ─────
+    - id: "${BREAKDOWN_CHANNEL_ID}"
+      name: "caller_a-breakdown"
+      priority: "low"
+      type: "breakdown"
+      linked_caller: "caller_a"
 
-    # # caller_a thesis/analysis
-    # - id: "${DAT_BREAKDOWN_CHANNEL_ID}"
-    # name: "caller_a-breakdown"
-    # priority: "low"
-    # type: "breakdown"
-    # linked_caller: "caller_a"
-
-    # ── caller_b ──────────────────────────────────────────────
-    # - id: "${BM_ALERTS_CHANNEL_ID}"
-    # name: "caller_b-alerts"
-    # priority: "high"
-    # type: "caller"
-    # caller: "caller_b"
-    # management_style: "managed"
-    # sizing_mode: "percentage"  # caller_b doesn't do a $500 challenge
-    # execute_trades: false      # Idea-only: notify but do not place orders
-
-    # - id: "${BM_BREAKDOWN_CHANNEL_ID}"
-    # name: "caller_b-breakdown"
-    # priority: "low"
-    # type: "breakdown"
-    # linked_caller: "caller_b"
-
-    # ── THE provider ────────────────────────────────────────────
-    # provider-bulletin: where the final curated pick is posted
-    # (caller_c-picks is just community threads for voting — not actionable)
-    # - id: "${provider_BULLETIN_CHANNEL_ID}"
-    # name: "provider-bulletin"
-    # priority: "high"
-    # type: "caller"
-    # caller: "provider-bulletin"
-    # management_style: "managed"
-    # sizing_mode: "percentage"
-    # execute_trades: false      # Idea-only: notify but do not place orders
-
-    # ── ta_source (TA context only) ─────────────────────────
-    # ta_source-breakroom removed: high-noise community channel, not worth
-    # the API cost. ta_source-analysis is the curated feed kept instead.
-    # - id: "${ta_source_ANALYSIS_CHANNEL_ID}"
-    # name: "ta_source-analysis"
-    # priority: "low"
-    # type: "breakdown"
-    # linked_caller: "caller_b"
-
-  # ── BOT CONTROL CHANNEL ──────────────────────────────────────────────────
-  # A private source channel (or DM) where YOU can send commands to control
-  # the bot remotely without being at your desk.
-  #
-  # Commands: !stop | !pause | !resume | !status | !cancel TICKER | !cancel all
-  # Session 10: !flag [tag|ticker|last] [note] — flag a misparse for the eval set
-  # (writes eval/inbox_flagged.jsonl)
-  #
-  # Set to a private channel only you can write in, or use a DM channel ID.
-  # Set to "" to disable the control channel.
-  #
-  # allowed_user_ids: list of Discord USER IDs (not display names) allowed to
-  # issue control commands.  Get yours by enabling Discord developer mode →
-  # right-click your username → Copy User ID.
-  # Session 9: when left empty, the bot no longer trusts every author in the
-  # channel — it defaults to trusting ONLY its own account's user ID.
-  control_channel_id: "${BOT_CONTROL_CHANNEL_ID}"
-  control_allowed_user_ids: []  # e.g. ["123456789012345678"]
-
-  # Author filter: only process messages from these Discord user display names
-  # Prevents parsing caller_b's banter in caller_a-alerts, community reactions, etc.
-  # Empty list or missing key = accept all authors in that channel
+  # Author allowlist per channel: prevents parsing community banter and
+  # reactions. Empty list or missing key = accept all authors in that channel.
   allowed_authors:
     caller_a-challenge:
       - "caller_a"
-    caller_a-alerts:
-      - "caller_a"
-    caller_b-alerts:
-      - "caller_b"
-    provider-bulletin: []  # Curated channel, accept all
 
-  # ═══ Session 11: structured alert-app embeds (BreadBot) ═══════════════════
-  # The provider began mirroring caller alerts through a notification app that
-  # posts machine-generated embeds:
-  #
-  #     🍞 $BYND — NEW CALL ENTRY
-  #     Trade ID  BAK-20260727-BYND-B1F0     Feed   #caller_a-alerts
-  #     Setup     Aug 21, 2027 • $5 Call
-  #     Entry     $1.00 limit • Contract Premium
-  #     Additional Notes  test
-  #     Alerted by caller_a • Informative only — not financial advice.
-  #
-  # These are template-generated, so signals/embed_parser.py reads them with a
-  # regex — no API call, no misparse, and a Trade ID that makes re-posts and
-  # backfill replays idempotent.
-  embed_alerts:
-    enabled: true
-
-    # ⚠️ THE SWITCH. false = parse, log and notify, but NEVER place or close an
-    # order from an app embed. The callers' typed alerts keep driving the
-    # account exactly as before.
-    #
-    # Flip to true only after watching real (non-test) alerts come through and
-    # confirming the parsed contract matches what the caller actually posted.
-    # The first two embeds seen (2026-07-28, $BYND) were rollout tests.
-    execute: false
-
-    # Exact Discord application/user IDs allowed to post alerts. Bot authors
-    # are rejected by the normal author filters on purpose (Session 9 / C5a),
-    # so this is the only way one gets through — keep it to IDs you verified.
-    bot_ids:
-      - "1531043598374666470"   # BreadBot (The provider), seen 2026-07-28
-
-    # Refuse alerts not attributed to a caller we follow. The embed footer says
-    # "Alerted by X"; empty list disables the check.
-    expected_traders:
-      - "caller_a"
-
-    # Sanity bounds — an alert failing any of these is refused with a named
-    # reason and a Discord notification, never quietly coerced into a trade.
-    max_expiry_days: 270          # A LEAP on a $1k challenge account is placeholder data
-    max_trade_id_age_days: 2      # Trade IDs carry their date; old ones are re-posts
-    require_contract_premium: true  # "Entry" must be an option premium, not the underlying
-
-    # When the app and the caller both announce one trade, act once. Whichever
-    # arrives first wins; the second is suppressed inside this window.
-    cross_dedup_window_seconds: 300
-
-  # Session 9: per-channel author allowlist by user ID (parallel to allowed_authors)
-  allowed_author_ids:
-    # Discord user IDs (preferred) — display names are spoofable by any server
-    # member; get IDs via right-click → Copy User ID with developer mode on.
-    # When non-empty, IDs are enforced and webhook/bot posts are rejected.
-    caller_a-challenge: []
-    caller_a-alerts: []
-    caller_b-alerts: []
-    provider-bulletin: []
 
 # --- Blocked Tickers ---
 # Signals for these tickers are skipped entirely — no trade, no notification.

@@ -30,16 +30,20 @@ It's written to be the single document needed to understand the entire system.
 ## 1. System Overview
 
 ### Purpose
-Follow paid Discord callers and social source TA accounts with a $1,000 Robinhood account.
-Both the user and the challenge caller (caller_a) are now at $1k, so the contract
-multiplier is 1.0 — a direct mirror. The system automates what a human would do:
-read the signal, decide sizing, place the order, manage the position, and exit when
-the caller does.
+Follow trade-alert channels ("callers") and technical-analysis sources with a
+small live options account. The reference deployment mirrored a caller's
+challenge account of the same size, so the contract multiplier is 1.0 — a
+direct mirror. The system automates what a human signal-follower would do:
+read the signal, decide sizing, place the order, manage the position, and exit
+when the caller does.
 
 ### Core Principle
-**Capital efficiency over over-protection.** This is a pilot account. The safety
-floor and per-trade caps have been removed; the only hard stops are the daily circuit
-breaker (40% loss halts all trading) and the expensive-contract guard.
+**Capital efficiency over over-protection.** The reference configuration is a
+deliberately aggressive small-account pilot: the account floor and per-trade
+caps are switched off in config, and the hard stops are the daily circuit
+breaker (40% loss halts all trading), the expensive-contract guard, and the
+PDT gate. Every one of these is a config value — a conservative posture is a
+one-line change, and the gate order below is unchanged either way.
 
 ### Pipeline
 ```
@@ -139,7 +143,7 @@ class ParsedSignal:
 
 The parser prompt includes extensive guidance for:
 
-**Robinhood screenshot format**:
+**Brokerage screenshot format** (Robinhood-style contract symbols):
 ```
 Contract symbol: -SPY260320P650
 - Ticker: SPY
@@ -232,7 +236,7 @@ class TradeDecision:
 1. **Account floor**: Disabled (floor = 0). Previously $150 — removed for pilot mode.
 2. **Daily circuit breaker**: Daily P&L < -40% of account → skip
 3. **PDT gate**: See [PDT Protection](#6-pdt-protection) section
-4. **SPX filter**: SPY/QQQ 0DTE → skip (UK Robinhood restriction)
+4. **Blocked-ticker filter**: SPY/QQQ and other US ETFs → skip (UK/EU PRIIPs restriction — see `blocked_tickers` in config)
 5. **Duplicate check**: Already in position for this ticker → notify only
 6. **Scale-in detection**: Entry for ticker we hold → update caller count, notify only
 
@@ -301,11 +305,13 @@ themselves are the effective ceiling.
 
 **Expensive contract protection**:
 If 1 contract costs > 60% of account → forced to starter tier.
-Example: TSLA $420P at $4.20 = $420/contract = 42% of $1k. Under threshold, allowed.
-SPY $650P at $6.50 = $650/contract = 65% of $1k. Over threshold, forced starter.
+Example on a $1k account: TSLA $420P at $4.20 = $420/contract = 42%. Under
+threshold, allowed. SPY $650P at $6.50 = $650/contract = 65%. Over threshold,
+forced starter.
 
-**Contract multiplier**: Set to **1.0** — both the challenge account and our account are
-now at $1k. For %-based sizing channels, the multiplier is not relevant.
+**Contract multiplier**: Set to **1.0** in the reference config — the mirrored
+challenge account and the trading account are the same size. For %-based
+sizing channels, the multiplier is not relevant.
 
 **Minimum contracts**: Always 1 if affordable.
 
@@ -313,7 +319,7 @@ now at $1k. For %-based sizing channels, the multiplier is not relevant.
 
 Configurable via `management.order_fill_timeout_seconds` (default: 90).
 The bot places a limit order (GFD), polls every second up to this timeout.
-On timeout, the order is **cancelled** immediately — never left live on Robinhood.
+On timeout, the order is **cancelled** immediately — never left resting at the broker.
 90 seconds gives the price time to come back without letting a stale order float.
 
 ---
@@ -321,8 +327,13 @@ On timeout, the order is **cancelled** immediately — never left live on Robinh
 ## 6. PDT Protection
 
 ### The Rule
-Under $25k, Robinhood flags accounts with 4+ "day trades" in a rolling 5 **business day**
+Under $25k, brokers flag margin accounts with 4+ "day trades" in a rolling 5 **business day**
 window. A day trade = opening and closing the same security on the same trading day.
+
+*(Note: the shipped `config.example.yaml` neutralises these layers with
+`max_day_trades_per_5_days: 999`, reflecting the June 2026 FINRA move from
+the PDT rule to intraday margin standards. The mechanism is kept intact and
+documented here — set the value to 3 to restore the original behaviour.)*
 
 ### Our Policy
 **Never trigger the flag.** Losing instant settlement (switching to cash account with
@@ -520,7 +531,7 @@ Match the caller's **ratio**: `caller_trim / caller_total = our_trim / our_total
 
 ### Problem
 Caller: "4 runners with 50% profit SL." They have 10+ contracts, can afford 4 runners.
-We have 1-2 contracts on a $1k account. Locking capital in a runner means missing the
+We have 1-2 contracts on a small account. Locking capital in a runner means missing the
 next high-conviction play.
 
 ### Solution
@@ -556,7 +567,7 @@ This context is valuable for conviction scoring but should never generate trades
 1. Message arrives from breakdown channel
 2. Parsed normally (can be TA, management, entry preview, or noise)
 3. If actionable: stored via `engine.store_breakdown()` and/or `engine.store_ta_context()`
-4. **Never routed to execution** — `main.py` returns after storing
+4. **Never routed to execution** — the orchestrator returns after storing
 5. When an alert later fires for a matching ticker:
    - `_check_breakdown_backing()` finds the breakdown
    - Checks: within 4 hours? Directional alignment? Same ticker?
@@ -583,26 +594,31 @@ quickly as new signals come in.
 
 ## 13. Startup Sequence
 
-On every start, `main.py` runs these steps in order:
+*(This section documents the private deployment's orchestrator, which is
+excluded from the public tree — see PORTING_NOTES.md. It is kept here because
+the restore/cross-reference logic it describes shapes the Position fields and
+trade-log format that ship in this repo.)*
 
-1. **Robinhood login** — exits hard if credentials fail
+On every start, the orchestrator runs these steps in order:
+
+1. **Brokerage login** — exits hard if credentials fail
 2. **Account balance** — logged at startup
 3. **Anthropic credit check** (`_check_anthropic_credits`):
    - Sends a 1-token ping to Claude Haiku (cheapest/fastest)
    - If credits exhausted: logs hard error + sends notification, bot continues but signals
      will fail to parse. Previously this was silent for 30+ minutes.
-4. **Position restore** (`_restore_positions_from_robinhood`):
-   - Fetches all open option positions from Robinhood
+4. **Position restore**:
+   - Fetches all open option positions from the brokerage
    - Loads `logs/trades.json` and builds a set of `OPEN` entries with no matching `CLOSE`
-   - For each Robinhood position:
+   - For each brokerage position:
      - **In trade log** → `bot_managed=True` — stop/trail logic resumes immediately
      - **Not in trade log** → `bot_managed=False` — tracked for price/P&L, no auto-exits
    - Logged as `[RESTORED BOT]` or `[RESTORED MANUAL]`
-5. **social source login**
+5. **Social-source login**
 6. **Notification** — "Agent started. Balance: $X"
 7. **Position monitor thread** starts
-8. **social source polling thread** starts
-9. **Discord listener** starts (blocking)
+8. **Social-source polling thread** starts
+9. **Chat listener** starts (blocking)
 
 ---
 
@@ -613,12 +629,13 @@ On every start, `main.py` runs these steps in order:
 | File | What's logged | Use case |
 |------|--------------|----------|
 | `agent.log` | Everything (main application log) | General debugging |
-| `discord_raw.log` | Every source message: channel, author, content, attachment count | Parser tuning, signal replay |
+| `discord.log` | Every raw source message: channel, author, content, attachment count | Parser tuning, signal replay |
 | `social.log` | Every social TA post checked: author, content, image count | Same |
-| `parser_results.log` | Parser input (raw message) → output (ParsedSignal JSON) | Verifying parser accuracy |
+| `parser.log` | Parser input (raw message) → output (ParsedSignal JSON) | Verifying parser accuracy |
 | `decisions.log` | Decision engine evaluations: conviction, sizing, action, reason | Understanding why trades were taken/skipped |
-| `executions.log` | Order placements, fills, prices, order IDs | Trade audit trail |
+| `trades.log` | Order placements, fills, exits, prices, order IDs | Trade audit trail |
 | `positions.log` | Position state: price, P&L, HWM, trailing stop, contracts | Position monitoring |
+| `errors.log` | All errors across all components | Triage |
 | `trades.json` | Structured JSON: every OPEN, CLOSE, TRIM with P&L | Performance analysis + restart cross-reference |
 | `pdt_tracker.json` | Day trade dates array + last updated | PDT compliance |
 
@@ -633,7 +650,7 @@ On every start, `main.py` runs these steps in order:
 risk:
   account_balance_floor: 0            # Disabled (pilot mode)
   max_single_trade_pct: 100           # Disabled (pilot mode)
-  max_day_trades_per_5_days: 3        # PDT limit
+  max_day_trades_per_5_days: 3        # PDT limit (shipped example uses 999 — see §6 note)
   pdt_emergency_reserve: 1            # Slots reserved for swing stop-outs
   default_stop_loss_pct: 30           # Standard SL
   high_conviction_stop_loss_pct: 50   # Wide SL for high conviction
@@ -643,7 +660,7 @@ risk:
 **Sizing**:
 ```yaml
 sizing:
-  contract_multiplier: 1.0            # Both accounts at $1k — direct mirror
+  contract_multiplier: 1.0            # Mirrored account same size — direct mirror
   starter_max_pct: 10
   light_max_pct: 15
   standard_max_pct: 25
@@ -671,10 +688,10 @@ management:
 
 ## 16. Data Flow Examples
 
-### Example 1: caller_a Challenge Entry (Post-Session 5)
+### Example 1: Caller Challenge Entry (Post-Session 5)
 
 ```
-Discord #caller_a-challenge-challenge: "GLW $190 Call 4/17 • 1 Buy 2.75 @everyone"
+#caller_a-challenge: "GLW $190 Call 4/17 • 1 Buy 2.75 @everyone"
 
 Pre-filter: passes (has ticker, price, direction)
 1. Parser → entry, GLW, call, 190, 2026-04-17, caller_contracts=1, entry_price=2.75
@@ -691,7 +708,7 @@ Pre-filter: passes (has ticker, price, direction)
 
 ```
 trades.json has: OPEN GLW_190.0_2026-04-17_call (no matching CLOSE)
-Robinhood has: GLW call + SATL call (user added manually)
+The brokerage reports: GLW call + SATL call (user added manually)
 
 Restore:
   [RESTORED BOT]    GLW $190.0 call — bot_managed=True, stop/trail ACTIVE
@@ -719,10 +736,10 @@ Next day 9:31 AM: checks opened_at vs today → different day → sells at marke
 ### Example 4: Breakdown → Alert Conviction Boost
 
 ```
-14:59 caller_a-breakdown: "QQQ head and shoulders. Nodes weakening." + heatmap_tool chart
+14:59 #caller_a-breakdown: "QQQ head and shoulders. Nodes weakening." + heatmap chart
 → Breakdown stored: QQQ, direction=put
 
-15:30 caller_b-alerts: "QQQ $530P 2/14 @here"
+15:30 #caller_b-alerts: "QQQ $530P 2/14 @here"
 → paid_caller(40) + @here(10) + breakdown_backing(10) = 60
    Without breakdown: 50 → standard sizing
    With breakdown: 60 → still standard but with wider stop (approaching high conviction)
@@ -732,24 +749,25 @@ Next day 9:31 AM: checks opened_at vs today → different day → sells at marke
 
 ## Development Notes
 
-### Current Status (Session 5)
-- Live monitoring of Discord (all channels) and social source (3 accounts)
-- Pilot mode: all per-trade caps removed, full balance available
-- Position persistence working: bot vs manual positions correctly distinguished on restart
+### Status at Extraction
+- The public tree runs end-to-end on the paper executor: `run_paper.py`
+  replays the bundled sample signals through parser → engine → execution
+- Pilot-mode reference config: per-trade caps off, circuit breaker +
+  expensive-contract guard as hard stops
+- Position persistence working: bot vs manual positions correctly
+  distinguished on restart via the trades.json cross-reference
 - Pre-filter saving API calls on obvious noise
-- social source auth fixed and confirmed working
+- 277 test functions (362 with parametrisation), all passing in CI
 
 ### Known Outstanding Issues
 - No T+1 settlement tracking for cash account mode
 - No 0DTE forced exit at 3:45 PM ET (could expire worthless)
-- Robinhood session expires ~24h; no auto-refresh implemented
-- No paper trading / simulation mode
+- Brokerage session expiry (~24h) had no auto-refresh in the private deployment
 - Race conditions on positions dict possible under concurrent signal storm (no thread lock)
 
 ### Future Improvements
-- Paper trading mode (log decisions without executing)
 - 0DTE time-based exit (3:45 PM ET hard close)
-- Robinhood session health check + auto-relogin
+- Brokerage session health check + auto-relogin
 - Web dashboard for monitoring
 - Performance analytics (win rate, avg P&L by caller, by conviction tier)
 - Earnings calendar integration (warn before holding through earnings)
