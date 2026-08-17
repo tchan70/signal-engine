@@ -1,9 +1,13 @@
 # Signal Engine
 
+[![CI](https://github.com/tchan70/signal-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/tchan70/signal-engine/actions/workflows/ci.yml)
+
 An LLM-powered pipeline that turns unstructured trade-alert messages into
 risk-checked, managed options positions. Built and hardened against live
 market conditions on a small account; published here as the broker- and
-source-agnostic core. See [PORTING_NOTES.md](PORTING_NOTES.md).
+source-agnostic core, so this repo's history starts at the extraction
+point — see [PORTING_NOTES.md](PORTING_NOTES.md) for what was carried
+over and what stayed private.
 
 ```
 Messages (JSONL / any source) ──→ AI Parser ──→ Decision Engine ──→ Executor
@@ -34,9 +38,10 @@ Messages (JSONL / any source) ──→ AI Parser ──→ Decision Engine ─�
   [docs/postmortems/llm-expiry-year-invention.md](docs/postmortems/llm-expiry-year-invention.md)
   covers the parser inventing an expiry year and the healing layer that
   now catches it.
-- **303 tests, all passing** - most written as regression suites against
-  live incidents (the `test_session*` / `test_bug*` names are the audit
-  trail of a system debugged in production).
+- **362 tests, all passing** (277 test functions) - most written as
+  regression suites against live incidents (the `test_session*` /
+  `test_bug*` names are the audit trail of a system debugged in
+  production).
 
 ## Quickstart
 
@@ -44,7 +49,7 @@ Messages (JSONL / any source) ──→ AI Parser ──→ Decision Engine ─�
 pip install -r requirements.txt
 python run_paper.py                      # offline demo, bundled sample signals
 ANTHROPIC_API_KEY=sk-... python run_paper.py --llm   # live Claude parsing
-python -m pytest tests/ -q               # 388 passed
+python -m pytest tests/ -q               # 362 passed
 ```
 
 ## Execution backends
@@ -65,3 +70,7 @@ variables only - never the repo.
 ingestion, parsing, decisioning, sizing, PDT protection, execution, trade
 management, trimming, runner policy, context stores, and the logging
 system.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

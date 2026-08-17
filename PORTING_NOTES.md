@@ -23,6 +23,7 @@ backtesting - and replaces the integration edges:
   (replaced with `eval/sample_signals.jsonl`, synthetic but schema-true)
 
 **What survived unchanged**
-- Parser, decision engine, trade constructor, trade manager, risk, price
-  math, eval harness, backtester
-- 303 test functions (388 including parametrisation) - all passing
+- Parser, decision engine (including the risk gates: daily circuit
+  breaker, PDT protection, expensive-contract guard), trade constructor,
+  trade manager, price math, eval harness, backtester
+- 277 test functions (362 including parametrisation) - all passing
