@@ -1,0 +1,19 @@
+# CRITICAL: without this file, docker build COPY . . bakes brokerage
+# credentials + the TOTP seed (which defeats MFA) + session cookies into
+# image layers.
+.env
+cookies.txt
+robinhood_session/
+session.tw_session
+logs/
+.venv/
+__pycache__/
+*.pyc
+.git/
+eval/
+tests/
+
+# The Heatseeker Watcher is a standalone sibling tool, not part of the bot image.
+# Without this line, docker build COPY . . bakes its .env (vision API keys) into
+# image layers and bloats the context with its venv.
+heatseeker-watcher/

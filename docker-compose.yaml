@@ -1,0 +1,52 @@
+# Trading Agent — Docker Compose
+#
+# Usage:
+#   docker compose up -d          # Start in background
+#   docker compose logs -f        # Stream logs
+#   docker compose down           # Stop
+#   docker compose restart        # Restart after code/config change
+#
+# First time:
+#   1. cp .env.example .env       (Mac/Linux)
+#      copy .env.example .env     (Windows)
+#   2. Fill in .env with your credentials
+#   3. docker compose up -d
+
+services:
+  trading-agent:
+    build: .
+    container_name: signal-trader
+    # Session 9: bounded restarts. The old `unless-stopped` + fixed `sleep 20`
+    # command wrapper permitted ~3 brokerage logins/min forever in a crash loop
+    # (OAuth lockout risk). The sleep wrapper is gone — crash-loop backoff for
+    # local runs now lives in start.py (exponential); in Docker this restart
+    # budget caps the damage instead.
+    restart: on-failure:10
+
+    # Session 16: a 0DTE sell can now be RESTING at the broker when a stop
+    # arrives, and shutdown waits (briefly) for that worker to cancel it. The
+    # default 10s grace would SIGKILL part-way through and skip the brokerage
+    # logout; 30s leaves room for the wait plus the ordinary shutdown work.
+    stop_grace_period: 30s
+
+    # Loads all vars from .env automatically
+    env_file:
+      - .env
+
+    environment:
+      # Session 9: match host log timestamps. Trading logic pins
+      # America/New_York via utils/market_time.py regardless of TZ.
+      - TZ=Europe/London
+
+    volumes:
+      # Persist logs outside the container
+      - ./logs:/app/logs
+      # Live-reload config without rebuild
+      - ./config.yaml:/app/config.yaml:ro
+    # No ports needed — outbound-only service
+
+    # Show pretty timestamps in docker compose logs
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

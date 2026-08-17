@@ -1,0 +1,9 @@
+# Pinned exactly - upgrade deliberately: bump, test, commit.
+anthropic==0.84.0
+pyyaml==6.0.3
+requests==2.32.5
+python-dotenv==1.2.2
+tzdata==2025.3  # IANA tz DB for zoneinfo in slim Docker images
+
+# Dev
+pytest==8.3.4

@@ -1,0 +1,797 @@
+# ============================================
+# SIGNAL TRADER AGENT - Configuration
+# ============================================
+
+# --- Account Type ---
+# "cash" = No PDT restrictions, T+1 settlement (recommended for small accounts)
+# "margin" = PDT protection active, instant settlement
+# Margin account — PDT limit (3 day trades / 5 rolling days) managed manually
+account:
+  type: "margin"  # cash | margin
+  starting_balance: 1000  # For reference only
+
+# --- Anthropic API (for signal parsing & chart analysis) ---
+anthropic:
+  api_key: "${ANTHROPIC_API_KEY}"
+  # Two-tier model strategy to minimise latency and cost:
+  #   text_model   → Used for structured text alerts (caller_a, caller_b format).
+  #                  Haiku is 3-5x faster than Sonnet and handles these fine.
+  #   vision_model → Used whenever a chart/screenshot image is attached.
+  #                  Sonnet has better chart-reading accuracy.
+  text_model: "claude-haiku-4-5-20251001"
+  vision_model: "claude-sonnet-4-5-20250929"
+  # Legacy alias kept for any code that reads `model` directly (falls back to Sonnet)
+  model: "claude-sonnet-4-5-20250929"
+  # Session 9: API call budget for the parser. Previously the client used SDK
+  # defaults (~10 min timeout) on the hot signal path, and 1024 max_tokens could
+  # truncate a response mid-JSON.
+  timeout_seconds: 20
+  max_retries: 1
+  max_tokens: 2048
+
+# --- Parser Autonomy (Session 10) ---
+# Session 10 — confidence-tiered autonomy: the parser now
+# self-reports parse confidence + ambiguities; certainty decides autonomy. Exits/trims are
+# NEVER confidence-blocked (following the caller out is always safer than not).
+parser:
+  # Session 10: ENTRY autonomy gate — a parse below this confidence is surfaced
+  # as an idea notification instead of being handed to the executor.
+  min_entry_confidence: 70       # ENTRY signals parsed below this confidence (0-100) are notify-only, never auto-traded
+  # Session 10: one-shot escalation — a low-confidence entry is re-parsed once
+  # with the bigger vision_model before the notify-only/auto-trade decision is final.
+  escalate_low_confidence: true  # Low-confidence entries get ONE re-parse with the bigger vision_model before deciding
+
+# --- Execution backend ---
+# "paper" (default, in-memory) | "mcp" (official Robinhood Agentic Trading
+# pilot - equities in beta, options pending). Live credentials, when a live
+# backend is used, come from environment variables only - never this file.
+
+# --- Execution Backend ---
+executor:
+  backend: "paper"  # paper | mcp
+  mcp_url: "https://agent.robinhood.com/mcp/trading"
+
+# --- Discord Signal Sources ---
+# the signal provider — follow caller_a + caller_b + caller_c-picks
+#
+# CHANNEL LAYOUT (as of Feb 2026):
+#   caller_b:       caller_b-alerts, caller_b-breakdown
+#   DOUGH DADDY:    dd-alerts, dd-breakdown
+#   REAL DONALD PUMP: rdp-alerts, spx-qqq-spy-alerts, 0dte-advisory-breakdown, rdp-breakdown
+#   caller_a:      caller_a-challenge, caller_a-breakdown, caller_a-alerts
+#   BRENT:          brent-alerts, brent-breakdown
+#   MRS. Z:         mrsz-alerts, mrs-z-flow, mrsz-breakdown
+#   SKINEE:         skinee-alerts, skinee-breakdown
+#   DOUGH DILIGENCE: creation-breakdown, piggys-breakdown
+#   THE provider:     high-risk-lottos-alerts, caller_c-picks
+#   Seek the Heat:  ta_source-analysis, ta_source-breakroom
+#
+# We follow: caller_a (both channels), caller_b, caller_c-picks
+# + breakdowns and ta_source for conviction boosting
+discord:
+  user_token: "${DISCORD_USER_TOKEN}"
+  # Session 9: cap on attachment/embed image downloads (bytes). Oversized files
+  # are skipped instead of being base64'd into a guaranteed API rejection.
+  image_max_bytes: 8388608  # 8 MB
+  # Session 10: reconnect backfill caps — on gateway reconnect the bot replays
+  # missed messages per channel, bounded by age and count so a long outage
+  # can't flood the pipeline with stale signals.
+  # Reconnect backfill: messages older than this are not replayed at all.
+  #
+  # Raised 120 → 720 on 2026-07-31. The bot is stopped overnight, so the
+  # morning start is a "reconnect" spanning the whole night, and at 120 the
+  # gate silently dropped everything posted in it. caller_a's "Will buy 1 SOUN"
+  # (01:09 BST) was fetched and discarded on the 05:45 start — the only trace
+  # was `1 skipped as older than 120 min`, which names no ticker.
+  #
+  # Raising it does NOT make old entries tradeable. A backfilled ENTRY older
+  # than `entry_stale_after_seconds` is routed notify-only (⏰ MISSED ENTRY
+  # (backfill)) and returns before the market-hours/queue logic is reached —
+  # so 12h buys visibility over the overnight channel, not exposure. Caller
+  # EXITS were never subject to this gate anyway: they are rescued by name
+  # (EXIT_HINT_RE) at any age, after the 2026-07-23 incident where ten dropped
+  # messages left the book out of sync.
+  #
+  # Cost is one parser call per overnight message on the morning start —
+  # cents, on a channel that posts a handful a day.
+  backfill_max_age_minutes: 720
+  backfill_limit: 50             # Max messages fetched per channel after a reconnect
+  # Session 10: gateway watchdog — prolonged silence during market hours usually
+  # means a dead connection, not a quiet channel; alert so a restart can happen.
+  watchdog_stale_minutes: 10     # Alert if the gateway is silent this long during market hours
+  # Session 10: stale-entry safety — a backfilled ENTRY has moved prices by the
+  # time it's replayed; past this age it's notify-only. Exits are never blocked.
+  entry_stale_after_seconds: 600 # Backfilled ENTRY signals older than this become notify-only (exits always process)
+  channels:
+    # ── caller_a ─────────────────────────────────────────────
+    # $500 challenge: always has contract counts → use challenge multiplier sizing
+    - id: "${DAT_500_CHALLENGE_CHANNEL_ID}"
+      name: "caller_a-challenge"
+      priority: "high"
+      type: "caller"
+      caller: "caller_a"
+      management_style: "challenge"  # Tight stop, high trail activation — see management section
+      sizing_mode: "challenge"       # Direct multiplier on caller's contract count
+
+    # Main their broker account plays: larger sizes, no contract counts → use % sizing
+    # execute_trades: false — idea-only until account grows; contracts too expensive
+    # ═══ Session 9b (2026-07-22): SINGLE-CHANNEL MODE ═══════════════════
+    # Only caller_a-challenge is live. The blocks below are intentionally
+    # commented out — breakdown/idea channels are for the operator's own reading,
+    # not bot interpretation. To re-enable a channel, uncomment its block.
+    # - id: "${DAT_ALERTS_CHANNEL_ID}"
+    # name: "caller_a-alerts"
+    # priority: "high"
+    # type: "caller"
+    # caller: "caller_a"
+    # management_style: "managed"
+    # sizing_mode: "percentage"  # Conviction-based % of account
+    # execute_trades: false      # Idea-only: notify but do not place orders
+
+    # # caller_a thesis/analysis
+    # - id: "${DAT_BREAKDOWN_CHANNEL_ID}"
+    # name: "caller_a-breakdown"
+    # priority: "low"
+    # type: "breakdown"
+    # linked_caller: "caller_a"
+
+    # ── caller_b ──────────────────────────────────────────────
+    # - id: "${BM_ALERTS_CHANNEL_ID}"
+    # name: "caller_b-alerts"
+    # priority: "high"
+    # type: "caller"
+    # caller: "caller_b"
+    # management_style: "managed"
+    # sizing_mode: "percentage"  # caller_b doesn't do a $500 challenge
+    # execute_trades: false      # Idea-only: notify but do not place orders
+
+    # - id: "${BM_BREAKDOWN_CHANNEL_ID}"
+    # name: "caller_b-breakdown"
+    # priority: "low"
+    # type: "breakdown"
+    # linked_caller: "caller_b"
+
+    # ── THE provider ────────────────────────────────────────────
+    # provider-bulletin: where the final curated pick is posted
+    # (caller_c-picks is just community threads for voting — not actionable)
+    # - id: "${provider_BULLETIN_CHANNEL_ID}"
+    # name: "provider-bulletin"
+    # priority: "high"
+    # type: "caller"
+    # caller: "provider-bulletin"
+    # management_style: "managed"
+    # sizing_mode: "percentage"
+    # execute_trades: false      # Idea-only: notify but do not place orders
+
+    # ── ta_source (TA context only) ─────────────────────────
+    # ta_source-breakroom removed: high-noise community channel, not worth
+    # the API cost. ta_source-analysis is the curated feed kept instead.
+    # - id: "${ta_source_ANALYSIS_CHANNEL_ID}"
+    # name: "ta_source-analysis"
+    # priority: "low"
+    # type: "breakdown"
+    # linked_caller: "caller_b"
+
+  # ── BOT CONTROL CHANNEL ──────────────────────────────────────────────────
+  # A private source channel (or DM) where YOU can send commands to control
+  # the bot remotely without being at your desk.
+  #
+  # Commands: !stop | !pause | !resume | !status | !cancel TICKER | !cancel all
+  # Session 10: !flag [tag|ticker|last] [note] — flag a misparse for the eval set
+  # (writes eval/inbox_flagged.jsonl)
+  #
+  # Set to a private channel only you can write in, or use a DM channel ID.
+  # Set to "" to disable the control channel.
+  #
+  # allowed_user_ids: list of Discord USER IDs (not display names) allowed to
+  # issue control commands.  Get yours by enabling Discord developer mode →
+  # right-click your username → Copy User ID.
+  # Session 9: when left empty, the bot no longer trusts every author in the
+  # channel — it defaults to trusting ONLY its own account's user ID.
+  control_channel_id: "${BOT_CONTROL_CHANNEL_ID}"
+  control_allowed_user_ids: []  # e.g. ["123456789012345678"]
+
+  # Author filter: only process messages from these Discord user display names
+  # Prevents parsing caller_b's banter in caller_a-alerts, community reactions, etc.
+  # Empty list or missing key = accept all authors in that channel
+  allowed_authors:
+    caller_a-challenge:
+      - "caller_a"
+    caller_a-alerts:
+      - "caller_a"
+    caller_b-alerts:
+      - "caller_b"
+    provider-bulletin: []  # Curated channel, accept all
+
+  # ═══ Session 11: structured alert-app embeds (BreadBot) ═══════════════════
+  # The provider began mirroring caller alerts through a notification app that
+  # posts machine-generated embeds:
+  #
+  #     🍞 $BYND — NEW CALL ENTRY
+  #     Trade ID  BAK-20260727-BYND-B1F0     Feed   #caller_a-alerts
+  #     Setup     Aug 21, 2027 • $5 Call
+  #     Entry     $1.00 limit • Contract Premium
+  #     Additional Notes  test
+  #     Alerted by caller_a • Informative only — not financial advice.
+  #
+  # These are template-generated, so signals/embed_parser.py reads them with a
+  # regex — no API call, no misparse, and a Trade ID that makes re-posts and
+  # backfill replays idempotent.
+  embed_alerts:
+    enabled: true
+
+    # ⚠️ THE SWITCH. false = parse, log and notify, but NEVER place or close an
+    # order from an app embed. The callers' typed alerts keep driving the
+    # account exactly as before.
+    #
+    # Flip to true only after watching real (non-test) alerts come through and
+    # confirming the parsed contract matches what the caller actually posted.
+    # The first two embeds seen (2026-07-28, $BYND) were rollout tests.
+    execute: false
+
+    # Exact Discord application/user IDs allowed to post alerts. Bot authors
+    # are rejected by the normal author filters on purpose (Session 9 / C5a),
+    # so this is the only way one gets through — keep it to IDs you verified.
+    bot_ids:
+      - "1531043598374666470"   # BreadBot (The provider), seen 2026-07-28
+
+    # Refuse alerts not attributed to a caller we follow. The embed footer says
+    # "Alerted by X"; empty list disables the check.
+    expected_traders:
+      - "caller_a"
+
+    # Sanity bounds — an alert failing any of these is refused with a named
+    # reason and a Discord notification, never quietly coerced into a trade.
+    max_expiry_days: 270          # A LEAP on a $1k challenge account is placeholder data
+    max_trade_id_age_days: 2      # Trade IDs carry their date; old ones are re-posts
+    require_contract_premium: true  # "Entry" must be an option premium, not the underlying
+
+    # When the app and the caller both announce one trade, act once. Whichever
+    # arrives first wins; the second is suppressed inside this window.
+    cross_dedup_window_seconds: 300
+
+  # Session 9: per-channel author allowlist by user ID (parallel to allowed_authors)
+  allowed_author_ids:
+    # Discord user IDs (preferred) — display names are spoofable by any server
+    # member; get IDs via right-click → Copy User ID with developer mode on.
+    # When non-empty, IDs are enforced and webhook/bot posts are rejected.
+    caller_a-challenge: []
+    caller_a-alerts: []
+    caller_b-alerts: []
+    provider-bulletin: []
+
+# --- Blocked Tickers ---
+# Signals for these tickers are skipped entirely — no trade, no notification.
+#
+# WHY: UK/EU PRIIPs regulation (in force since 2018) prohibits retail investors
+# from trading US-listed ETFs because they lack the required Key Information
+# Document (KID). This covers ALL US ETFs — not just SPY/QQQ.
+# Individual US stocks (AAPL, NVDA, TSLA, etc.) are fully available.
+# SPX (the index itself) is available — use it instead of SPY for index plays.
+#
+# Add any other tickers you personally can't or don't want to trade.
+blocked_tickers:
+  # ── Broad market ETFs ─────────────────────────────────────────────────────
+  - "SPY"    # S&P 500 — use SPX instead
+  - "QQQ"    # Nasdaq 100 — no direct replacement; skip
+  - "IWM"    # Russell 2000
+  - "DIA"    # Dow Jones
+
+  # ── Sector SPDR ETFs ──────────────────────────────────────────────────────
+  - "XLF"    # Financials
+  - "XLE"    # Energy
+  - "XLK"    # Technology
+  - "XLV"    # Healthcare
+  - "XLU"    # Utilities
+  - "XLP"    # Consumer Staples
+  - "XLY"    # Consumer Discretionary
+  - "XLI"    # Industrials
+  - "XLB"    # Materials
+  - "XLRE"   # Real Estate
+
+  # ── Volatility ETFs ───────────────────────────────────────────────────────
+  - "VXX"    # Short-term VIX futures
+  - "UVXY"   # 1.5x VIX
+  - "SVXY"   # Inverse VIX
+
+  # ── Leveraged / inverse ETFs ──────────────────────────────────────────────
+  - "DRAM"   # Memory/semiconductor ETF — CONFIRMED blocked for UK 2026-08-03:
+             # opening buy rejected "You can only close positions on the given
+             # option" (the SPY signature). caller_a rode it +70%; unmirrorable.
+  - "TQQQ"   # 3x Nasdaq
+  - "SQQQ"   # 3x inverse Nasdaq
+  - "UPRO"   # 3x S&P 500
+  - "SPXU"   # 3x inverse S&P 500
+  - "SOXL"   # 3x semiconductors
+  - "SOXS"   # 3x inverse semiconductors
+  - "TNA"    # 3x Russell 2000
+  - "TZA"    # 3x inverse Russell 2000
+  - "LABU"   # 3x biotech
+  - "LABD"   # 3x inverse biotech
+  - "FNGU"   # 3x FANG+
+  - "FNGD"   # 3x inverse FANG+
+
+  # ── Commodity ETFs ────────────────────────────────────────────────────────
+  - "GLD"    # Gold
+  - "SLV"    # Silver
+  - "USO"    # Oil
+  - "UNG"    # Natural gas
+
+  # ── Bond / rate ETFs ──────────────────────────────────────────────────────
+  - "TLT"    # 20yr Treasury
+  - "HYG"    # High yield bonds
+  - "LQD"    # Investment grade bonds
+  - "SHY"    # Short-term Treasury
+
+  # ── Leveraged S&P ETFs (often mentioned by provider callers) ───────────────
+  - "SPXL"   # 3x S&P 500 bull (Direxion)
+  - "SPXS"   # 3x S&P 500 bear (Direxion)
+  - "SPYM"   # ProShares S&P 500 Yield Focused ETF
+  - "SSO"    # 2x S&P 500 (ProShares)
+  - "SDS"    # 2x inverse S&P 500 (ProShares)
+
+  # ── Leveraged Nasdaq ETFs ─────────────────────────────────────────────────
+  - "QLD"    # 2x Nasdaq (ProShares)
+  - "QID"    # 2x inverse Nasdaq (ProShares)
+
+  # ── Options income ETFs (growing, frequently mentioned) ──────────────────
+  - "CONY"   # Coinbase covered calls income ETF
+  - "NVDY"   # NVIDIA covered calls income ETF
+  - "MSFO"   # Microsoft covered calls income ETF
+  - "TSLY"   # Tesla covered calls income ETF
+  - "AMZY"   # Amazon covered calls income ETF
+  - "GOOGY"  # Alphabet covered calls income ETF
+  - "YBTC"   # Bitcoin options income ETF
+
+  # ── Crypto ETFs ───────────────────────────────────────────────────────────
+  - "BITO"   # Bitcoin futures ETF (ProShares)
+  - "BITB"   # Bitwise Bitcoin ETF
+  - "FBTC"   # Fidelity Bitcoin ETF
+
+  # ── Gold ETFs ─────────────────────────────────────────────────────────────
+  - "GLDM"   # SPDR Gold MiniShares
+  - "AAAU"   # Goldman Sachs Physical Gold ETF
+  - "IAU"    # iShares Gold Trust
+
+  # ── International / thematic ETFs ────────────────────────────────────────
+  - "EEM"    # Emerging markets
+  - "EFA"    # Developed markets ex-US
+  - "FXI"    # China large cap
+  - "ARKK"   # ARK Innovation
+  - "IBIT"   # BlackRock Bitcoin ETF
+
+# --- Risk Management ---
+risk:
+  account_balance_floor: 0            # No floor — full balance available (pilot mode)
+  max_single_trade_pct: 100           # No per-trade cap (pilot mode)
+  # Session 9c (2026-07-22): PDT is DEAD. FINRA replaced the Pattern Day Trader
+  # rule with intraday margin standards on 2026-06-04 (applies to Robinhood UK
+  # margin accounts — flags wiped, no $25k minimum, no day-trade counting).
+  # Account policy: pure margin, unlimited day trades. 999 neutralizes all
+  # three PDT layers (entry gating, exit blocking, trim blocking) without code
+  # changes; the day-trade tracker still logs for audit. To resurrect the old
+  # behaviour (e.g. if regulation changes back), set this to 3 again.
+  max_day_trades_per_5_days: 999
+  pdt_emergency_reserve: 1            # Inert while max is 999 (kept for resurrection)
+  default_stop_loss_pct: 30           # Default SL for standard trades (%)
+  high_conviction_stop_loss_pct: 50   # Wider SL for high conviction
+  circuit_breaker_daily_loss_pct: 40  # Stop trading if down this % in a day
+
+# --- Position Sizing ---
+# Two-layer sizing: first determine the "intent" (how many contracts the caller
+# suggests), then cap it against the account as a safety net.
+#
+# For the $500 challenge follow (with 2x sizing due to $1k account):
+# The callers in that channel are sizing for a $500 account.
+# We double their suggested contract count since we have double the capital.
+sizing:
+  # Multiplier applied to caller's suggested contract count
+  # Set to 1.0 because both accounts are now at $1k
+  contract_multiplier: 1.0
+  
+  # When no contract count is specified, use these as % of account
+  # to determine max spend, then buy as many contracts as that allows
+  starter_max_pct: 10       # "ONE starter contract" / testing
+  light_max_pct: 15         # "Light size"
+  standard_max_pct: 25      # No sizing hint given
+  heavy_max_pct: 40         # "Load the boat" / high conviction
+  
+  # Hard cap: set to 100 to disable (pilot mode — no per-trade ceiling)
+  absolute_max_pct: 100
+  
+  # Minimum: always buy at least 1 contract if we can afford it
+  min_contracts: 1
+  
+  # If a single contract costs more than this % of account, downgrade
+  # to starter sizing regardless of signal (expensive contract protection)
+  expensive_contract_threshold_pct: 60
+
+# --- Volatility Regime Gate (Session 9) ---
+# Scales percentage-tier sizing by realized-vol regime so the bot sizes down
+# BEFORE a loss on high-vol days, not just after (classifier in engine/regime.py).
+# Challenge mirror mode is unaffected — only percentage tiers scale.
+# SPY here is a data source for realized vol only, never traded (blocked_tickers).
+regime:
+  enabled: true
+  symbol: "SPY"
+  lookback_days: 6         # Trading days of closes used for realized vol
+  calm_vol: 0.15           # Annualized realized vol below this = calm
+  stressed_vol: 0.28       # Above this = stressed; in between = elevated
+  multipliers:
+    calm: 1.0
+    elevated: 0.6
+    stressed: 0.3
+
+# --- Trade Management ---
+management:
+  # Trailing stop MASTER SWITCH.
+  # Day 4 (the operator, 2026-08-03): trails removed — the caller's posted exits are
+  # the exit strategy (plus the 0DTE sweep and expiry booking). This key was
+  # DEAD from Session 9 until 2026-08-03; it is now wired in
+  # _check_trailing_stop and gates FIRING as well as arming, so it also covers
+  # positions restored with old per-position rules or an already-armed trail.
+  # Caller-INSTRUCTED stops are exempt: a runner post's stated "N% profit SL"
+  # still arms a static profit floor — that is the caller's instruction
+  # mirrored, not a price exit the bot invented. (The floor engages only once
+  # price has traded above the stated level — two confirmed readings — so a
+  # level above our market can never sell on arrival.)
+  enable_trailing_stop: false
+  trailing_stop_activation_pct: 50    # (inert while master switch is off)
+  trailing_stop_distance_pct: 25      # (inert while master switch is off)
+
+  # Day 4 (BUG-40): after a sell fails to PLACE and the broker either still
+  # holds the contract or can't be reached, price-inferred exit retries for
+  # that position pause this long (instructions are never paused). Stops the
+  # ~11s fire→fail→🚨 loop that spammed ~10 SELL FAILED pings in 100 seconds
+  # on 2026-08-03 after AAL was sold by hand. A PROVEN-absent contract is
+  # booked as an external close instead and never retries.
+  sell_fail_backoff_seconds: 300
+
+  # Caller-managed swing positions (caller_a-alerts, caller_b-alerts: management_style=managed)
+  # use a LOWER activation threshold. OXY peaked +27% then fell to -8% with no trail
+  # because the 50% threshold was never reached. 20% activation captures swing gains
+  # early while still filtering out normal bid/ask noise.
+  caller_managed_trailing_stop_activation_pct: 20   # Activate at 20% for swing trades
+  caller_managed_trailing_stop_distance_pct: 15      # Tighter 15% trail once activated
+
+  # Challenge mode (caller_a-challenge: management_style=challenge)
+  # caller_a always posts explicit exits — no hard stop needed, let positions play.
+  # No profit tiers: we follow caller exits rather than auto-trimming.
+  #
+  # TRAIL REMOVED (the operator, 2026-08-03): activation set far beyond any reachable
+  # P&L so the challenge trail NEVER arms. caller_a's posted exits are the exit
+  # strategy (plus the 0DTE sweep and expiry booking). History that led here:
+  # Session 14 widened 20→30 after the trail sold XSP's recoverable dip at
+  # +74% (caller_a +112% later); 2026-08-03 a trail sold MRVL at +8.7% while caller_a
+  # held to +60%. Three times the trail sold a winner the caller kept; its one
+  # apparent save (day-1 XSP +42%) was a phantom-quote artifact. NOTE: only
+  # takes effect for NEW entries — restored positions carry rules from their
+  # ledger OPEN entry; the WIRED master switch `enable_trailing_stop: false`
+  # above (dead from Session 9 until 2026-08-03, live since) is what covers
+  # those, making this sentinel belt-and-braces.
+  challenge_trailing_stop_activation_pct: 100000    # effectively: never arm
+  challenge_trailing_stop_distance_pct: 30          # irrelevant while trail never arms
+  
+  # Profit taking tiers (% of position to trim at each level)
+  profit_tiers:
+    - gain_pct: 50
+      trim_pct: 25    # Take 25% off at 50% gain
+    - gain_pct: 100
+      trim_pct: 25    # Take another 25% at 100% (2x)
+    - gain_pct: 200
+      trim_pct: 25    # Another 25% at 200% (3x)
+    # Final 25% runs with trailing stop
+  
+  # How long to wait for a limit order to fill before cancelling (seconds)
+  # Options are liquid but 30s is tight — 60-90s gives price time to come back
+  order_fill_timeout_seconds: 90
+
+  # Session 9 (C2): sell orders are now polled to fill just like buys — on
+  # timeout the order is cancelled and escalated instead of being booked as filled.
+  sell_fill_timeout_seconds: 45
+
+  # 2026-08-04 — Exit ladder for NON-URGENT full exits on WIDE books.
+  #
+  # The QCOM $240c caller exit: caller_a posted "0.44 20% out QCOM" into a
+  # $0.36 × $0.51 book (34.5% spread, vol=1). The wide-spread tier priced
+  # the mirror at bid-3% and filled $0.36 — the caller +20%, the bot -5.3%,
+  # the difference the donated half-spread with no stampede to beat.
+  #
+  # When a caller full exit (or any non-urgent full exit) meets a two-sided
+  # book wider than min_spread_pct, the sell now RESTS near mid and walks
+  # down: mid (lifted to the caller's printed price when higher) →
+  # bid + 25% of spread → bid, each resting step_seconds, then the normal
+  # aggressive sweep. Worst case it fills ~2 min later at the same price as
+  # today; best case it captures most of the spread.
+  #
+  # NEVER applies to: stops/floors/0DTE sweep (urgent — speed wins), any
+  # 0DTE position (dying books need BUG-38 aggression), tight books,
+  # one-sided books, paper mode, or the last ~4 minutes before the close.
+  exit_ladder:
+    enabled: true
+    min_spread_pct: 15   # ladder only when (ask-bid)/mid exceeds this
+    step_seconds: 20     # rest per rung; 3 rungs + 45s sweep ≈ 105s worst case
+
+  # Session 16 — the 0DTE forced exit rests its LAST attempt.
+  #
+  # 2026-07-30: the 15:45 sweep found XSP 727P × 2 at $0.01, placed two
+  # 45-second attempts, could not fill (no bid), and gave up at 15:47 with
+  # thirteen minutes of market left. It expired worthless for -$18.
+  #
+  # A limit order left working costs nothing and is the only strategy that can
+  # catch a stray bid on a dying contract, so the second attempt now rests
+  # until this many minutes before the 16:00 close, then cancels and inspects
+  # (a fill during the rest is still booked normally). Applies ONLY to the
+  # expiry sweep; every other exit keeps the two-attempt flow, because there
+  # the position lives on and a resting order would delay the stop.
+  #
+  # Raising this gives the cancel more room before the book empties; lowering
+  # it buys a little more resting time. 2 is deliberately blunt.
+  zero_dte_rest_margin_minutes: 2
+
+  # Session 16 — when an expiry booking gets a LOUD notification.
+  #
+  # An expiry writes no CLOSE of its own, so one is synthesised at 16:05 and
+  # the loss finally reaches trades.json, the EOD summary and the circuit
+  # breaker. A contract that finished IN THE MONEY did not become worthless
+  # though — it produces real proceeds (shares for an equity option, cash for
+  # an index one) that the synthetic row does not record.
+  #
+  # This is NOT a veto. The first draft made it one, refusing to book anything
+  # marked above the threshold, and review found that a dead OTM contract
+  # routinely rests at $0.04-$0.30 purely from a one-sided book (bid 0.00 /
+  # ask 0.40 marks at 0.20) — so the veto would have refused most ordinary
+  # worthless expiries, recreating the invisible-loss bug it was meant to fix,
+  # while leaving the dead position in the book to re-alert every day.
+  #
+  # So the loss is always booked; a mark above this only sends the
+  # notification to the error channel, asking for one row to be checked by
+  # hand. Raise it if routine expiries are shouting; lower it if a settled
+  # contract ever slips by quietly.
+  expiry_suspicious_price: 0.15
+
+  # After opening a position, suppress ALL automated exits (stop-loss, trailing stop,
+  # caller exits) for this many seconds.  Originally 120 to prevent:
+  #   1. Bid/ask spread: fill at ask, first price check returns mid → apparent -15% loss
+  #      triggers stop before the position has had a chance to move.
+  #   2. Fast callers (caller_a): caller enters and exits within 60s; with the old
+  #      confirmation delay, the buy would fire AFTER the exit signal was already
+  #      queued, causing an instant round-trip.
+  #
+  # SET TO 0 (the operator, 2026-08-03): the cooldown branch in handle_caller_exit
+  # runs BEFORE the signal-type dispatch, so on 2026-08-03 a status-update
+  # management signal (caller_a's their broker screenshot, posted 14s after the MRVL
+  # entry, parser notes literally "not an exit or trim") armed the hard-coded
+  # -15% cooldown trail, which sold MRVL at +8.7% while caller_a held to +60%.
+  # With no trails (see challenge_trailing_stop_activation_pct) and
+  # stop_loss_pct 0, failure mode 1 has nothing left to fire, and failure
+  # mode 2 is now WANTED behaviour: if caller_a round-trips in 60s, the mirror
+  # round-trips too. Read live by both cooldown sites, so this covers
+  # restored positions as well — 0 disables the branch entirely.
+  entry_stop_cooldown_seconds: 0
+
+  # Entry price slippage tolerance (%)
+  # When the caller states an entry price (e.g. "5 Buys $1.50"), Discord latency
+  # + AI parsing time means the ask may have moved by the time the order lands.
+  # If the live ask is within this % above the caller's price, we chase it using
+  # the live ask + 2% buffer (same as a no-price signal) so we don't miss the trade.
+  # If the ask has blown through this tolerance, the caller's price is used as the
+  # strict limit — it will likely time out and cancel, which is the right outcome
+  # (the trade has moved too far from the intended entry).
+  # Set to 0 to always use the caller's price exactly (no chasing).
+  entry_slippage_tolerance_pct: 5
+
+  # Override: if caller posts exit, follow it
+  follow_caller_exits: true
+  
+  # For high conviction (like your SATL example), disable auto-tiers
+  high_conviction_override: true
+  high_conviction_trailing_only: true  # Just use trailing stop, no tiers
+
+  # --- RUNNER POLICY (small account capital efficiency) ---
+  # On a $1k account, leaving runners ties up capital we need for the next play.
+  # When the caller says "X runners" (i.e., trimmed most and leaving the rest),
+  # we EXIT FULLY unless the trade has very high conviction.
+  #
+  # The logic: caller with 10 contracts can afford to leave 4 runners.
+  # We with 1-2 contracts can't afford to have capital locked in a runner
+  # when the next high-conviction play hits.
+  # Session 10f: ignore the first N seconds of the session for AUTOMATED
+  # stop/trail decisions and high-water-mark updates. The 9:30 ET opening
+  # quote is frequently a stale-mark artefact — on 2026-07-27 it printed TE at
+  # $1.02 against a real $0.55, armed a trailing stop and fired it six seconds
+  # later. Caller exits are NOT gated by this; they fire whenever they arrive.
+  market_open_settle_seconds: 60
+  # Session 12: position-monitor watchdog (own thread, never calls the
+  # broker). Two signatures, both from the 2026-07-28 outage: FROZEN — no
+  # monitor pass completed for this long during market hours (hung call);
+  # NO BROKER QUOTES — passes complete but no price fetch has succeeded while
+  # positions are open (fail-fast outage). Alerts to Discord, throttled by
+  # the broker alert cooldown. The root cause is also fixed —
+  # a default HTTP timeout on every brokerage call means
+  # timeout so hangs fail fast — but the watchdog does not assume its own
+  # fix works.
+  position_monitor_stale_minutes: 5
+
+  # Session 13 (BUG-33): quote sanity band. A price more than this many times
+  # the reference (last accepted quote, or entry before there is one) in either
+  # direction is discarded like a failed fetch — no P&L, no high-water mark, no
+  # stop or trail evaluation. On 2026-07-28 a wrong-contract quote put XSP at
+  # $43.33 against an $0.82 entry: +5,184%, and a trailing stop armed at $34.70
+  # on the first poll. The root cause is fixed in the private brokerage
+  # executor (_resolve_option_id); this is the independent backstop for the next one.
+  # Set to 0 or 1 to disable.
+  #
+  # Wide on purpose. There is no self-healing: a rejection stands until an
+  # in-band quote arrives, because a WRONG contract quotes just as consistently
+  # as a right one (the first draft re-anchored onto $43.33 after three
+  # agreeing polls and armed the trail anyway). So the band has to be loose
+  # enough that a real move is never mistaken for fiction — 10x still catches
+  # the 53x that started this — and a rejected position alerts in Discord
+  # rather than recovering on its own. Caller exits are unaffected either way.
+  quote_sanity_max_ratio: 10
+
+  # Session 15 (BUG-36): how many CONSECUTIVE monitor readings must agree
+  # before an exit that is INFERRED FROM PRICE fires — stop loss, trailing
+  # stop, profit tier. Set to 0 or 1 to act on a single reading; note that
+  # the re-quote below is a SEPARATE check and still applies, so turning both
+  # off is what restores the pre-Session-15 behaviour exactly.
+  #
+  # Live, 2026-07-29, the first real-money trail exit. XSP 710P, trigger
+  # $0.30:  0.34 -> 0.40 -> [0.28] -> sold, and the urgent sell FILLED AT
+  # $0.37 two seconds later. A bid-priced sell cannot fill at 0.37 if the book
+  # is at 0.28, so the tick was fiction; the real dip that afternoon bottomed
+  # at 0.33, comfortably above the trigger. caller_a TP'd at +160% seven minutes
+  # after we booked +42%.
+  #
+  # The 60/30 settings were not at fault and are unchanged — the trigger was.
+  # At a ~6s poll, 2 readings costs at most ~12 seconds on a genuine exit,
+  # which is nothing against a caller-exit-driven mirror where the trail is
+  # only the disaster brake. Measured against the one day of real quote data
+  # we have, the median next-tick return after a big down-tick was 0.0%, so
+  # the delay usually costs nothing; the tail case is a 0DTE cliff, worth
+  # $9-15 on one contract against the ~$31 the phantom cost on day one.
+  #
+  # Do NOT raise this to 3: every phantom observed in the live logs lasted a
+  # single tick, so 3 catches nothing 2 misses and doubles the cliff cost.
+  # The high-water mark has its OWN switch below — this knob does not
+  # control it.
+  #
+  # Caller exits, the deferred exit_at_open, the PDT next-day sell and the
+  # 15:45 0DTE sweep are instructions, not inferences, and are NEVER gated.
+  exit_confirmation_ticks: 2
+  # Readings are counted in monitor PASSES, not merely in number. A pass on
+  # which a position could not be evaluated — no quote, an out-of-band quote,
+  # the opening settle, the entry cooldown — breaks the run. Without that,
+  # two unrelated glitches either side of an eight-minute quote outage would
+  # "confirm" each other.
+  #
+  # Take one fresh quote at the moment of firing; it must also agree. Catches
+  # a glitch spanning both readings. A re-quote that fails or returns an
+  # implausible price does NOT veto the exit — by then N readings have agreed,
+  # and a stop that stops working when the broker goes quiet is worse than a
+  # stop that fires. A veto is logged AND sent to Discord: "the trail wanted
+  # to exit and was overruled" is worth a human's attention.
+  exit_confirmation_requote: true
+  # Whether a new high must be seconded before it ratchets the high-water
+  # mark. Its own switch on purpose: the fire delay above costs a tick in a
+  # genuine collapse, whereas this has no cost in a monotone move and
+  # prevents a PERMANENT corruption — the mark only ever goes up, the sidecar
+  # persists it, and every later trigger is computed from it. S has carried a
+  # phantom $1.07 since 2026-07-27. Turning the fire delay down should not
+  # silently disable this too.
+  confirm_high_water_mark: true
+
+  runner_policy:
+    # Session 10f: conviction no longer decides this. The old
+    # runner_conviction_threshold: 85 gate was dead in one direction —
+    # challenge entries carry conviction 50, so the bot ALWAYS sold out when
+    # the caller said they were keeping a runner. Conviction is the lever for
+    # TA-context sources, not for signal-following.
+    #
+    # true  = mirror the caller: keep the position, arm a profit lock (default)
+    # false = bank it and free the capital on a small account
+    follow_caller_runners: true
+    
+    # RETIRED (Day 4, 2026-08-03): the runner stop now mirrors the caller's
+    # STATED level ("50% profit SL" → a static floor at entry × 1.5), read
+    # from his own message — not a percentage of whatever our gain happened
+    # to be. This key is no longer read anywhere; kept only so old configs
+    # load. No stated level → nothing armed; his exit post closes it.
+    runner_profit_lock_pct: 30  # (inert since 2026-08-03)
+
+# --- Conviction Scoring Weights ---
+scoring:
+  # How to weight different signal sources
+  source_weights:
+    paid_caller: 40
+    technical_analysis: 35
+    unpaid_setup: 15
+    multi_source_alignment: 10  # Bonus when multiple sources agree
+    breakdown_backing: 10       # Bonus when caller posted thesis in breakdown channel
+  
+  # Conviction thresholds
+  thresholds:
+    low: 30
+    medium: 50
+    high: 70
+    extreme: 85   # Multiple sources aligned + strong TA
+
+# --- Decision Engine (Session 9) ---
+engine:
+  # TA context (ta_source/Han posts) expires after this many hours when used
+  # for conviction boosting. Was hardcoded to 7 days — stale for daily gamma maps.
+  ta_context_max_age_hours: 24
+
+# --- Notification ---
+notifications:
+  # --- Execution mode ---
+  # auto_trade: true  = Bot executes immediately when conviction threshold is met.
+  #                     No confirmation step. Balance is pre-checked; if insufficient
+  #                     the trade is logged and silently skipped (no ping).
+  # auto_trade: false = Confirmation-mode (safer for testing).
+  #                     Session 9: webhooks cannot receive reactions, so the old
+  #                     "React ❌ to cancel" claim was fiction. How it actually
+  #                     works: you get a decision notification, then the trade
+  #                     auto-executes after 60 seconds UNLESS you send
+  #                     `!cancel TICKER` (or `!cancel all`) in the control
+  #                     channel first. `!pause` blocks all new entries.
+  # Session 10f (2026-07-28, the operator): auto_trade TRUE.
+  # The 60-second window only protects you if you are watching during that
+  # minute — he monitors from the chat source while at work, so for an absent user it
+  # bought nothing and cost slippage on trades he would have taken anyway.
+  # Measured in-session latency without it: 8-10s from his message to the
+  # position, nearly all of it the vision parse of his screenshot.
+  #
+  # What still gates an entry, all UPSTREAM of this flag (main.py ~903 vs
+  # ~1698), so none of it is lost:
+  #   min_entry_confidence: 70   below this -> notify-only, never auto-traded
+  #   escalate_low_confidence    one re-parse on the bigger model first
+  #   PARSE_ERROR                never silently dropped
+  #   _paused                    a paused bot drops parsed entries
+  #   C4 validation              strike/price/contract range + JSON schema
+  #   circuit breaker            40% daily loss halts new entries
+  # And `!pause` remains the kill switch. Pre-market entries still queue with
+  # a long `!cancel` window — only the in-session 60s delay is removed.
+  auto_trade: true
+
+  # Legacy alias — only consulted when auto_trade is false, so INERT while
+  # auto_trade is true. Left set so flipping back restores the 60s window.
+  confirmation_mode: true
+
+  notification_method: "discord"  # discord | telegram | console
+  discord_webhook_url: "${NOTIFICATION_WEBHOOK_URL}"
+
+  # --- Paper trading mode ---
+  # paper_trade: true  = Bot parses signals, scores conviction, and logs exactly
+  #                      what it WOULD have traded — but never sends any order to
+  #                      Robinhood. Fill prices are simulated from the submitted
+  #                      limit price. Position management (stops, trails) still
+  #                      runs in memory so you can watch how the bot would behave.
+  #                      Set to false (or remove) when ready to go live.
+  paper_trade: false
+
+  # --- Discord @ mentions ---
+  # Prepend a mention to important webhook notifications (fills, exits, errors).
+  # This makes the bot ping you directly in Discord rather than posting silently.
+  #
+  # mention_user_id: your Discord user ID — right-click your name in Discord
+  #                  with Developer Mode on (Settings → Advanced → Developer Mode)
+  #                  then "Copy User ID". Produces a real @the operator ping.
+  # mention_on:      event types that trigger the mention.
+  #                  Options: fill | exit | error | paper_trade | all
+  #
+  # Leave mention_user_id blank/unset to disable pings entirely.
+  mention_user_id: "${DISCORD_MENTION_USER_ID}"  # e.g. "123456789012345678"
+  mention_on:
+    - fill        # Order filled on Robinhood
+    - exit        # Position closed (stop-loss, trailing stop, caller exit)
+    - error       # Order failures, API errors, buying-power blocks
+
+# --- Operational ---
+operations:
+  market_hours_only: true
+  timezone: "US/Eastern"
+  log_level: "DEBUG"  # Use DEBUG during initial testing, INFO for production
+  trade_log_path: "./logs/trades.json"
+  check_interval_seconds: 5
