@@ -24,6 +24,9 @@ RUN mkdir -p logs
 
 # Health check: verify the process is running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD pgrep -f "python main.py" || exit 1
+    CMD pgrep -f "python run_paper.py" || exit 1
 
-CMD ["python", "main.py"]
+# The public tree's entrypoint is the paper-trading pipeline. The private
+# deployment ran a long-lived orchestrator (main.py, excluded — see
+# PORTING_NOTES.md); a live adapter would swap its entrypoint in here.
+CMD ["python", "run_paper.py"]

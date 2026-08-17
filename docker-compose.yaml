@@ -10,7 +10,8 @@
 #   1. cp .env.example .env       (Mac/Linux)
 #      copy .env.example .env     (Windows)
 #   2. Fill in .env with your credentials
-#   3. docker compose up -d
+#   3. cp config.example.yaml config.yaml   (edit to taste)
+#   4. docker compose up -d
 
 services:
   trading-agent:
@@ -18,9 +19,8 @@ services:
     container_name: signal-trader
     # Session 9: bounded restarts. The old `unless-stopped` + fixed `sleep 20`
     # command wrapper permitted ~3 brokerage logins/min forever in a crash loop
-    # (OAuth lockout risk). The sleep wrapper is gone — crash-loop backoff for
-    # local runs now lives in start.py (exponential); in Docker this restart
-    # budget caps the damage instead.
+    # (OAuth lockout risk). The sleep wrapper is gone — this restart budget
+    # caps the damage instead.
     restart: on-failure:10
 
     # Session 16: a 0DTE sell can now be RESTING at the broker when a stop
